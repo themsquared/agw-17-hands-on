@@ -1,14 +1,14 @@
 # agw-17-hands-on
 
-[agentgateway v1.7.0](https://github.com/agentgateway/agentgateway/releases/tag/v1.7.0) (GA, 2026-10-27) adds an in-process CEL guardrail processor for MCP traffic: `mcpGuardrails.processors` can now reject or rewrite a `tools/call` request or response with a CEL expression, no external service required. This repo validates it against a real agentgateway binary and a toy two-tool MCP server: one safe tool, one destructive tool the gateway blocks before it ever reaches the backend.
+[agentgateway v1.7.0](https://github.com/agentgateway/agentgateway/releases/tag/v1.7.0) (GA, 2026-10-27) auto-detects which coding-agent session a request belongs to, from headers like Claude Code's `x-claude-code-session-id`, and exposes it to CEL and access logs as `request.agent.session`. This repo validates the detection rule against a real agentgateway binary and a mock LLM backend: which headers count, which don't, and the exact length/character rule that silently drops a session id that looks fine at a glance.
 
-No Kubernetes, no Docker required (though the Docker image also works). One native binary, one config file, one Python MCP server run through `uv`.
+No Kubernetes, no API key, no network calls. One native binary, one 40-line mock backend, five curl requests.
 
 ## What this proves
 
-1. **A CEL rule can block a specific MCP tool call, in-process.** `mcpGuardrails.processors` with `condition: mcp.params.name == 'delete_database'` and a `reject` string stops the call at the gateway. The response comes back as `isError: true` with the configured message.
-2. **The blocked call never reaches the backend.** The toy MCP server's own stderr log proves it: `list_files` logs a line when called, `delete_database` never does, because the gateway rejects it before forwarding.
-3. **A gotcha worth knowing.** The v1.7.0 release notes' own example config uses `kind: cel`. The actual schema accepts `kind: expression` only. `kind: cel` fails `--validate-only` with `unknown variant 'cel', expected 'remote' or 'expression'`. This repo's config uses the working value.
+1. **Any `x-<vendor>-session-id` header is detected, not just Claude Code's.** A request with `x-cursor-session-id` gets `request.agent.session` populated exactly like `x-claude-code-session-id` does. The mechanism is generic across coding agents, not a Claude-specific special case.
+2. **A session id under 8 characters is silently ignored.** `short1` (6 characters) on an otherwise-valid `x-claude-code-session-id` header never shows up as `agent.session` in the log. No error, no rejection, the request just has no detected session.
+3. **No header means no session field at all**, not an empty string. `agent.session` is absent from the log line entirely rather than `agent.session=""`.
 
 ## The config
 
@@ -16,52 +16,59 @@ No Kubernetes, no Docker required (though the Docker image also works). One nati
 # config/config.yaml
 config:
   session:
-    key: disabled   # demo only: v1.7 standalone MCP sessions are encrypted by default
-mcp:
-  port: 3000
-  policies:
-    mcpGuardrails:
-      processors:
-      - kind: expression   # NOT "cel" -- see the gotcha above
-        methods: {"tools/call": request}
-        condition: mcp.params.name == 'delete_database'
-        reject: "delete_database is blocked by gateway policy"
-  targets:
-  - name: toyops
-    stdio:
-      cmd: uv
-      args: ["run", "--with", "mcp[cli]", "python3", "toy_mcp_server.py"]
+    key: disabled   # demo only: v1.7 standalone always provisions a session key on first run
+frontendPolicies:
+  accessLog:
+    add:
+      agent.session: request.agent.session
+llm:
+  port: 4000
+  models:
+  - name: mock
+    provider:
+      custom:
+        formats:
+        - type: completions
+    params:
+      baseUrl: http://127.0.0.1:8091/v1
+      model: mock-model
 ```
 
-`config.session.key: disabled` is set only so the demo doesn't write a generated key file to disk on every run. A real deployment should leave session encryption on, per the v1.7.0 breaking-change notes.
+`provider: custom` with `formats: [{type: completions}]` points agentgateway at any OpenAI-compatible Chat Completions endpoint, in this case a mock server on localhost, so this demo needs no real provider API key. `request.agent.session` is a new CEL field in v1.7.0; `accessLog.add` is how you get a CEL value into the structured request log, the same mechanism the [v1.6.0 cost-tracking demo](https://webofmike.com/agentgateway-v16-cost-tracking/) used for `llm.cost.total`.
 
-## The toy MCP server
+## The mock backend
 
 ```python
-# toy_mcp_server.py
-from mcp.server.mcpserver import MCPServer
+# mock_llm.py
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 
-mcp = MCPServer("toy-ops-server")
-
-@mcp.tool()
-def list_files(path: str = ".") -> str:
-    """List files in a directory (read-only, safe)."""
-    return f"README.md\nconfig.yaml\nmain.py  (in {path})"
-
-@mcp.tool()
-def delete_database(name: str) -> str:
-    """Permanently delete a named database. Destructive."""
-    return f"DELETED database '{name}'"
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        req = json.loads(self.rfile.read(length) or b"{}")
+        resp = {
+            "id": "chatcmpl-mock-1", "object": "chat.completion", "created": 0,
+            "model": req.get("model", "mock-model"),
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "mock reply"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+        }
+        data = json.dumps(resp).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    ThreadingHTTPServer(("127.0.0.1", 8091), Handler).serve_forever()
 ```
 
-Note: the MCP Python SDK renamed `FastMCP` to `MCPServer` in its 2.x release (`from mcp.server.mcpserver import MCPServer`), which is what `uv run --with mcp[cli]` resolves to today. The 1.x `fastmcp` import path raises `ModuleNotFoundError` with a migration pointer.
+A fixed OpenAI-shaped response, no model call, no cost. The feature under test lives entirely in agentgateway's request handling, before the backend ever sees the request, so a real LLM backend would show the identical `agent.session` behavior.
 
 ## Quickstart
 
-Requirements: macOS (Apple Silicon) or Linux, `curl`, and [`uv`](https://docs.astral.sh/uv/) (runs the MCP server with no separate `pip install`). No API key needed; nothing in this demo calls an LLM.
+Requirements: macOS (Apple Silicon) or Linux, `curl`, Python 3. No API key.
 
 ```bash
 git clone https://github.com/themsquared/agw-17-hands-on.git
@@ -69,56 +76,52 @@ cd agw-17-hands-on
 ./run-demo.sh
 ```
 
-The script downloads the matching `agentgateway` v1.7.0 binary for your platform if one isn't already present, validates the config, starts the gateway, and fires the three requests below.
-
-Check the config against the v1.7.0 schema without starting anything:
-
-```bash
-./agentgateway-bin -f config/config.yaml --validate-only
-```
+The script downloads the matching `agentgateway` v1.7.0 binary for your platform if one isn't already present, starts the mock backend and the gateway, and fires the five requests below.
 
 ## What the run actually showed
 
 ```
-$ curl -s -X POST http://localhost:3000/mcp -d '{"method":"initialize",...}'
-mcp-session-id: e93bb9ce-ca55-412e-8f32-bc846fa50028
-
-$ curl -s -X POST http://localhost:3000/mcp -H "Mcp-Session-Id: $SESSION" \
-    -d '{"method":"tools/call","params":{"name":"list_files","arguments":{"path":"/tmp"}}}'
-{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"README.md\nconfig.yaml\nmain.py  (in /tmp)"}],"isError":false}}
-
-$ curl -s -X POST http://localhost:3000/mcp -H "Mcp-Session-Id: $SESSION" \
-    -d '{"method":"tools/call","params":{"name":"delete_database","arguments":{"name":"prod"}}}'
-{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"delete_database is blocked by gateway policy"}],"isError":true}}
+$ curl -s -X POST http://localhost:4000/v1/chat/completions \
+    -H "x-claude-code-session-id: 79291636abc123" -d '{...}'
+$ curl -s -X POST http://localhost:4000/v1/chat/completions \
+    -H "x-claude-code-session-id: 79291636abc123" -d '{...}'
+$ curl -s -X POST http://localhost:4000/v1/chat/completions \
+    -H "x-cursor-session-id: cursorsession999" -d '{...}'
+$ curl -s -X POST http://localhost:4000/v1/chat/completions -d '{...}'
+$ curl -s -X POST http://localhost:4000/v1/chat/completions \
+    -H "x-claude-code-session-id: short1" -d '{...}'
 ```
 
-And the toy server's own stderr, after both calls:
+All five return `HTTP 200`. The access log tells the real story:
 
 ```
-[toy-ops-server] list_files called with path=/tmp
+http.path=/v1/chat/completions agent.session="79291636abc123"
+http.path=/v1/chat/completions agent.session="79291636abc123"
+http.path=/v1/chat/completions agent.session="cursorsession999"
+http.path=/v1/chat/completions
+http.path=/v1/chat/completions
 ```
 
-One line. `delete_database` never printed its `DELETE_DATABASE EXECUTED` line, because it never ran.
+Requests 1 and 2 share a session, matching the header. Request 3's completely different vendor header still gets picked up. Requests 4 and 5 have no `agent.session` field at all: one sent no header, the other's `short1` is 6 characters, under the minimum of 8.
 
-### The `kind: cel` gotcha
+### The validation rule, from the source
 
-```
-$ ./agentgateway-bin -f config-with-kind-cel.yaml --validate-only
-Error: mcp.policies.mcpGuardrails.processors[0]: unknown variant `cel`, expected `remote` or `expression` at line 10 column 9
-```
+agentgateway's session detection (`crates/agentgateway/src/http/session.rs` in the v1.7.0 tag) requires a header shaped `x-<vendor>-session-id`, with a value that is at least 8 characters and only letters, digits, hyphens, or underscores. Anything shorter, or containing another character, is treated as if the header were absent, not as an error. If you're wondering why a session id isn't showing up in your own logs, check length and character set before anything else: there's no rejection or warning to point you at it.
 
-The release notes' own snippet for this feature uses `kind: cel`. The schema in the shipped v1.7.0 binary only accepts `expression` (in-process CEL) or `remote` (an external service). Use `kind: expression`.
+### Overriding detection
+
+`config.standardAttributes.session` takes a CEL expression that runs before the header-based fallback. Returning `null` from that expression marks the request as having no session even if a valid vendor header is present; this repo doesn't set it, so detection falls through to the header scan described above.
 
 ## What this doesn't cover
 
-- **Response-side masking.** `mcpGuardrails.processors` also runs on `tools/call` responses (`methods: {"tools/call": response}`) to rewrite returned content, e.g. redacting secrets in tool output. This repo only demonstrates the request-rejection path; agentgateway's own [`examples/mcp-guardrails/expression`](https://github.com/agentgateway/agentgateway/tree/main/examples/mcp-guardrails/expression) shows masking with `regexReplaceAll`.
-- **Kubernetes.** This is the standalone binary. v1.7.0 also ships a `remote` guardrail kind for calling an external policy service, and Kubernetes-native MCP conditional targets, neither exercised here.
-- **The rest of v1.7.0.** This release also ships model-catalog metadata over `/v1/models`, service-tier-aware cost pricing, and `agctl standalone analytics` -- separate features, not covered by this repo.
+- **Codex's session headers.** v1.7.0 also recognizes Codex's unprefixed `session-id`/`conversation_id` headers, but only when the `User-Agent` string starts with `codex`. Not exercised here.
+- **A real LLM provider.** The mock backend proves the gateway-side behavior; it doesn't exercise agentgateway's real Anthropic, OpenAI, Bedrock, or Gemini integrations.
+- **The rest of v1.7.0.** This release also ships `mcpGuardrails` CEL rules for MCP tool calls (see [MCP Tool-Call Guardrails](https://webofmike.com/tool-call-guardrails/), written against a pre-release build), model-catalog metadata over `/v1/models`, service-tier-aware cost pricing, and `agctl standalone analytics` -- separate features, not covered by this repo.
 
 ## Related reading
 
 - [agentgateway v1.7.0 release notes](https://github.com/agentgateway/agentgateway/releases/tag/v1.7.0)
-- [agentgateway MCP guardrails docs](https://agentgateway.dev/docs/)
+- [agentgateway v1.6.0: Cost Tracking With No Catalog Config](https://webofmike.com/agentgateway-v16-cost-tracking/) (the same `accessLog.add` CEL-to-log mechanism)
 
 ## License
 
