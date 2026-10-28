@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+config:
+  session:
+    key: disabled   # demo only: v1.7 standalone MCP sessions are encrypted by default (see README)
+mcp:
+  port: 3000
+  policies:
+    mcpGuardrails:
+      processors:
+      - kind: expression   # NOT "cel" -- see README gotcha
+        methods: {"tools/call": request}
+        condition: mcp.params.name == 'delete_database'
+        reject: "delete_database is blocked by gateway policy"
+  targets:
+  - name: toyops
+    stdio:
+      cmd: uv
+      args: ["run", "--with", "mcp[cli]", "python3", "toy_mcp_server.py"]
