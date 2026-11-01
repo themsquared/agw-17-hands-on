@@ -1,5 +1,7 @@
 # agw-17-hands-on
 
+> 📖 **Read the write-up:** [agentgateway v1.7.0: How Agent Session Detection Works](https://webofmike.com/agentgateway-v17-agent-sessions/)
+
 [agentgateway v1.7.0](https://github.com/agentgateway/agentgateway/releases/tag/v1.7.0) (GA, 2026-10-27) auto-detects which coding-agent session a request belongs to, from headers like Claude Code's `x-claude-code-session-id`, and exposes it to CEL and access logs as `request.agent.session`. This repo validates the detection rule against a real agentgateway binary and a mock LLM backend: which headers count, which don't, and the exact length/character rule that silently drops a session id that looks fine at a glance.
 
 No Kubernetes, no API key, no network calls. One native binary, one 40-line mock backend, five curl requests.
